@@ -56,7 +56,7 @@ OPTIMIZER_SUMMARIES = [
 
 # necessary to redefine this function for pure float16 support
 def get_regularization_loss(scope=None, name="total_regularization_loss"):
-  """Gets the total regularization loss.
+  """Gets the total regularization loss in float32 data type.
 
   Args:
     scope: An optional scope name for filtering the losses to return.
@@ -74,6 +74,18 @@ def get_regularization_loss(scope=None, name="total_regularization_loss"):
 
 
 def reduce_gradients(grads_and_vars, on_horovod, model=None):
+  """ Reduce operations for gradients.
+  Args:
+      grads_and_vars (list of tuples): 
+          Tuple include 2 tensorflow.Tensor, for gradients and 
+          correspondings variables.
+      on_horovod (bool): 
+          If using horovod.tensorflow for distributed training.
+      model (None or model?): Model.
+
+  Returns:
+      (tuple of tensorflow.Tensor): Gradients and variables.
+  """
   if on_horovod:
     from horovod.tensorflow import allreduce, size
 
@@ -243,13 +255,21 @@ def optimize_loss(loss,
                 global_step=global_step,
             )
 
+          # Similiar with pytorch gradient handeling method, 
+          # maintain a `accu_grad`, and which should be settle 0 
+          # after each training step.
           with tf.control_dependencies([red_grad_updates]):
             return tf.group([tf.assign(g, tf.zeros_like(g))
                              for g, v in grads_and_vars_accum])
 
+        # ?: `skip_update_ph` represents skip update parameters phase.
         grad_updates = tf.cond(
             pred=skip_update_ph,
+            # If `skip_update_ph == True`, then just accumulate gradients but 
+            # not use them to update the parameters.
             true_fn=lambda: accum_op,
+            # If `skip_update_ph == False`, then update parameters with 
+            # accumulated gradients / n.
             false_fn=update_and_clear_op,
         )
       else:

@@ -243,6 +243,11 @@ def optimize_loss(loss,
         accum_op = tf.group(accum_ops)
 
         def update_and_clear_op():
+          """ A recursive function.
+          This is a recursive part for reduce_gradients, this function defined 
+          in the scope `if iter_size > 1:`, which means it will iterate many 
+          times, and that why here can use recursive form.
+          """
           with tf.control_dependencies([accum_op]):
             red_grad_updates = opt.apply_gradients(
                 post_process_gradients(
@@ -273,6 +278,8 @@ def optimize_loss(loss,
             false_fn=update_and_clear_op,
         )
       else:
+        # Now `iter_size == 1` case. Here is also a recursive form, but 
+        # only execute once time since the iterative time is 1.
         grad_updates = opt.apply_gradients(
             post_process_gradients(
                 reduce_gradients(grads_and_vars, on_horovod=True, model=model),
@@ -284,6 +291,8 @@ def optimize_loss(loss,
             global_step=global_step,
         )
     else:
+      # In this case, not using `horovod.tensorflow` to implement 
+      # distributed training.
       grad_updates = opt.apply_gradients(
           post_process_gradients(
               grads_and_vars,
@@ -402,6 +411,7 @@ def _global_norm_with_cast(grads_and_vars):
 
 def _clip_gradients_by_norm(grads_and_vars, clip_gradients):
   """Clips gradients by global norm."""
+  # Unzip to seperate the gradients and variables.
   gradients, variables = zip(*grads_and_vars)
   dtypes = [var.dtype for var in variables]
 
@@ -417,11 +427,12 @@ def _clip_gradients_by_norm(grads_and_vars, clip_gradients):
       tf.cast(grad, dtype)
       for grad, dtype in zip(clipped_gradients, dtypes)
   ]
-
+  # Re-zip the gradients and variables as their original form.
   return list(zip(clipped_gradients, variables))
 
 def _clip_by_global_norm(t_list, clip_norm, use_norm, name=None):
   """Clips values of multiple tensors by the ratio of the sum of their norms.
+  
   Given a tuple or list of tensors `t_list`, and a clipping ratio `clip_norm`,
   this operation returns a list of clipped tensors `list_clipped`
   and the global norm (`global_norm`) of all tensors in `t_list`. The global
@@ -432,6 +443,7 @@ def _clip_by_global_norm(t_list, clip_norm, use_norm, name=None):
       global_norm = sqrt(sum([l2norm(t)**2 for t in t_list]))
   If `clip_norm > global_norm` then the entries in `t_list` remain as they are,
   otherwise they're all shrunk by the global ratio.
+
   Any of the entries of `t_list` that are of type `None` are ignored.
   This is the correct way to perform gradient clipping (for example, see
   [Pascanu et al., 2012](http://arxiv.org/abs/1211.5063)

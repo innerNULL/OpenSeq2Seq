@@ -19,6 +19,7 @@ class MixedPrecisionOptimizerWrapper(tf.train.Optimizer):
     self._optimizer = optimizer
     self._fp32_to_fp16 = {}
     self._loss_scaler = None
+
     if loss_scale is None:
       self._loss_scale = 1.0
     elif isinstance(loss_scale, float):
@@ -49,9 +50,11 @@ class MixedPrecisionOptimizerWrapper(tf.train.Optimizer):
     grads_and_vars_fp32 = []
     with tf.variable_scope('FP32-master-copy'):
       for grad, var in grads_and_vars_fp16:
+        # The float16 data type case:
         if var.dtype.base_dtype == tf.float16:
           fp32_var = tf.Variable(
-              initial_value=tf.cast(var.initialized_value(), tf.float32),
+              initial_value=tf.cast(
+                  var.initialized_value(), tf.float32),
               name=var.name.split(':')[0],
               expected_shape=var.shape,
               dtype=tf.float32,
@@ -61,6 +64,8 @@ class MixedPrecisionOptimizerWrapper(tf.train.Optimizer):
               collections=[tf.GraphKeys.GLOBAL_VARIABLES,
                            "FP32_MASTER_COPIES"],
           )
+          # `self._fp32_to_fp16` is a buffer which saving the 
+          # float16 data type copies of float32 variables.
           self._fp32_to_fp16[fp32_var.name] = var
           fp32_grad = tf.cast(grad, tf.float32)
           # adding regularization part with respect to fp32 copy
@@ -75,6 +80,7 @@ class MixedPrecisionOptimizerWrapper(tf.train.Optimizer):
             )[0]
           grads_and_vars_fp32.append((fp32_grad, fp32_var))
         else:
+          # float32 data type case:
           grads_and_vars_fp32.append((grad, var))
 
     grads_and_vars_fp32 = _scale_grads(grads_and_vars_fp32,
@@ -83,35 +89,70 @@ class MixedPrecisionOptimizerWrapper(tf.train.Optimizer):
 
   def apply_gradients(self, grads_and_vars, global_step=None, name=None):
     def apply_ops_wrapper():
+      """ Operations wrapper.
+      Wraps the operations which will be used to update 
+      gradients.
+      """
       update_op = self._optimizer.apply_gradients(grads_and_vars,
                                                   global_step, name)
       apply_ops = []
       with tf.control_dependencies([update_op]):
         for grad, var in grads_and_vars:
           if var.name in self._fp32_to_fp16:
+          # Which means the var is a float16 type tensor.
             dst_var = self._fp32_to_fp16[var.name]
+            # Notice `tf.saturate_cast` function, this is a 
+            # "clamping" operation and which will be used 
+            # before `tf.cast`, and which will help handeling 
+            # over/underflow problems.
             apply_ops.append(
                 tf.assign(dst_var, tf.saturate_cast(var, tf.float16))
             )
+      # As above codes, the `apply_ops` list is used to collect 
+      # some data type convertion operations, and this will only 
+      # happen when using mixed precision training since only in 
+      # this case, the `apply_ops` will not be empty.
       if apply_ops:
         return tf.group(apply_ops)
       return update_op
 
     if self._loss_scaler:
-      grad_has_nans, grad_amax = AutomaticLossScaler.check_grads(grads_and_vars)
-      should_skip_update = tf.logical_or(tf.is_inf(grad_amax), grad_has_nans)
-      loss_scale_update_op = self._loss_scaler.update_op(grad_has_nans,
-                                                         grad_amax)
+      grad_has_nans, grad_amax = \
+          AutomaticLossScaler.check_grads(grads_and_vars)
+
+      # If update or not.
+      should_skip_update = tf.logical_or(
+          tf.is_inf(grad_amax), grad_has_nans
+      )
+      loss_scale_update_op = self._loss_scaler.update_op(
+        grad_has_nans, grad_amax
+      )
       with tf.control_dependencies([loss_scale_update_op]):
-        return tf.cond(should_skip_update, tf.no_op, apply_ops_wrapper)
+        return tf.cond(
+            pred=should_skip_update, 
+            true_fn=tf.no_op, false_fn=apply_ops_wrapper
+        )
     else:
       return apply_ops_wrapper()
 
 
 def mp_regularizer_wrapper(regularizer):
+  """
+  Handeling regularizer during mixed precision training, 
+  "mp" represents "mixed precision".
+  Args:
+      regularizer (function); Regularizer.
+  Returns:
+      (function): Wrapped function.
+  """
   def func_wrapper(weights):
+    # If the weights' data type is float16, which means using 
+    # mixed precision train method, so should using some 
+    # special handeling method.
     if weights.dtype.base_dtype == tf.float16:
-      tf.add_to_collection('REGULARIZATION_FUNCTIONS', (weights, regularizer))
+      tf.add_to_collection(
+          'REGULARIZATION_FUNCTIONS', (weights, regularizer)
+      )
       # disabling the inner regularizer
       return None
     return regularizer(weights)
@@ -123,6 +164,7 @@ def _scale_grads(grads_and_vars, scale):
   scaled_grads_and_vars = []
   for grad, var in grads_and_vars:
     if grad is not None:
+      # If using sparse representation.
       if isinstance(grad, tf.IndexedSlices):
         grad_values = grad.values * scale
         grad = tf.IndexedSlices(grad_values, grad.indices, grad.dense_shape)

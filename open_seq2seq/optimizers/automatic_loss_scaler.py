@@ -29,6 +29,10 @@ class AutomaticLossScaler(object):
 
   @staticmethod
   def check_grads(grads_and_vars):
+    """ Check and analysis each gradient tensor.
+    Returns:
+        (tuple of tensorflow.Tensor): Such as (has_nan, amax).
+    """
     has_nan_ops = []
     amax_ops = []
 
@@ -39,10 +43,12 @@ class AutomaticLossScaler(object):
         else:
           x = grad
 
+        # Check if there any NaN in current gradient tensor.
         has_nan_ops.append(tf.reduce_any(tf.is_nan(x)))
         amax_ops.append(tf.reduce_max(tf.abs(x)))
 
     has_nan = tf.reduce_any(has_nan_ops)
+    # `amax` represents max absolute value.
     amax = tf.reduce_max(amax_ops)
     return has_nan, amax
 
@@ -61,8 +67,12 @@ class BackoffScaler(object):
             'step_window': int
         },
     )
+    # ?: In this case, max and min represents absolute value's 
+    # max and min values.
     self.scale_min = params.get('scale_min', 1.0)
     self.scale_max = params.get('scale_max', 2.**24)
+    # `self.step_factor` controls the loss scaling factor 
+    # change.
     self.step_factor = params.get('step_factor', 2.0)
     self.step_window = params.get('step_window', 2000)
 
@@ -77,6 +87,10 @@ class BackoffScaler(object):
 
   def update_op(self, has_nan, amax):
     def overflow_case():
+      """ Overflow case.
+      In this case, the float32 number is out of the float16
+      representable range.
+      """
       new_scale_val = tf.clip_by_value(self.scale / self.step_factor,
                                        self.scale_min, self.scale_max)
       scale_assign = tf.assign(self.scale, new_scale_val)
@@ -86,17 +100,34 @@ class BackoffScaler(object):
         return tf.identity(self.scale)
 
     def scale_case():
+      # `since_overflow` means how many iterations happened since 
+      # last overflow case happened.
       since_overflow = self.iteration - self.last_overflow_iteration
+      # Define parameters' update rule.
       should_update = tf.equal(since_overflow % self.step_window, 0)
+
       def scale_update_fn():
-        new_scale_val = tf.clip_by_value(self.scale * self.step_factor,
-                                         self.scale_min, self.scale_max)
+        # The reason of using `tf.clip_by_value` is which can 
+        # promise after multiplying with loss scaling factor, 
+        # `self.step_factor`, the value, `new_scale_val`, still 
+        # in the range of [self.scale_min, self.scale_max], 
+        # espically not smaller than `self.scale_min`.
+        new_scale_val = tf.clip_by_value(
+            self.scale * self.step_factor,
+            self.scale_min, self.scale_max
+        )
+        # Assigned handeled scalled value to `self.scale`.
         return tf.assign(self.scale, new_scale_val)
+
+      # If currerent iteration number is the one should update 
+      # scaled value. 
       return tf.cond(should_update,
                      scale_update_fn,
                      lambda: self.scale)
 
     iter_update = tf.assign_add(self.iteration, 1)
+
+    # Check if overflow.
     overflow = tf.logical_or(has_nan, tf.is_inf(amax))
 
     update_op = tf.cond(overflow,
